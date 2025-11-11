@@ -12,9 +12,10 @@
   main{display:grid;grid-template-columns:minmax(330px,360px) 1fr;gap:18px;padding:0 var(--pad) var(--pad)}
   .card{background:#fff;border:1px solid var(--bd);border-radius:var(--r);padding:var(--pad)}
   label{display:block;font-size:12px;color:var(--muted);margin:10px 0 6px}
-  input,select{width:100%;height:34px;padding:6px 10px;border:1px solid var(--bd);border-radius:10px;font-size:14px}
+  input,select,button{height:34px}
+  input,select{width:100%;padding:6px 10px;border:1px solid var(--bd);border-radius:10px;font-size:14px}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-  button{height:36px;border:0;background:var(--accent);color:#fff;border-radius:999px;padding:0 14px;font-weight:600;cursor:pointer}
+  button{border:0;background:var(--accent);color:#fff;border-radius:999px;padding:0 14px;font-weight:600;cursor:pointer}
   .kpi{font-size:13px;margin-top:8px}
   canvas{display:block;width:100%;background:#fff;border:1px solid var(--bd);border-radius:12px}
   input:disabled{background:#f5f7fa;color:#888;border-color:#e6e6e6}
@@ -26,6 +27,7 @@
   .sliderRow{display:grid;grid-template-columns:1fr 90px;gap:8px;align-items:center}
   input[type=range]{height:34px}
   #legend{font-size:12px;margin-top:8px;color:#333;text-align:center}
+  .hr{height:1px;background:var(--bd);margin:10px 0}
 </style>
 </head>
 <body>
@@ -177,6 +179,13 @@
     </div>
 
     <div class="kpi" id="kpi">—</div>
+
+    <div class="hr"></div>
+    <div class="krow" style="justify-content:space-between">
+      <button id="animBtn" style="background:#10b981">Animate</button>
+      <button id="animStopBtn" style="background:#ef4444">Stop</button>
+      <span id="animBadge" class="kpi">Idle.</span>
+    </div>
   </section>
 
   <!-- Right visuals -->
@@ -198,20 +207,26 @@
 
 <script>
 (function(){
-  // ---------- helpers ----------
   const $ = id=>document.getElementById(id);
   const must=id=>{const el=$(id);if(!el)throw Error('#'+id+' missing');return el;};
   const gauss2=[-1/Math.SQRT2, 1/Math.SQRT2];
 
   let lastMesh=null,lastU=null,lastShearMin=0,lastShearMax=0;
-  // NEW: cumulative nodal shear storage
   let shearCumNodal=null;
 
-  // material from G & K
+  /* -------- Animation state (single place) -------- */
+  let animFrames = [],   // [{mesh, u, shearCum, F, dx}]
+      animPts    = [],   // [{dx,F}] cumulative for FD
+      animTimer  = null,
+      animIdx    = 0,
+      animPlaying= false,
+      animDir    = 1;    // ping-pong direction
+
+  /* ---------- Materials ---------- */
   function matFromGK(G,K){ return {mu:G, lambda: K - 2*G/3}; }
   function nuFromGK(G,K){ return (3*K-2*G)/(2*(3*K+G)); }
 
-  // shape functions for Q4
+  /* ---------- Shapes ---------- */
   function shapeQ4(xi,eta){
     const N=[0.25*(1-xi)*(1-eta), 0.25*(1+xi)*(1-eta), 0.25*(1+xi)*(1+eta), 0.25*(1-xi)*(1+eta)];
     const dNdxi=[-0.25*(1-eta), 0.25*(1-eta), 0.25*(1+eta), -0.25*(1+eta)];
@@ -219,8 +234,8 @@
     return {N,dNdxi,dNdeta};
   }
 
-  // geometry profiles
-  function lerp(a,b,t){ return a+(b-a)*t; }
+  /* ---------- Geometry ---------- */
+  const lerp=(a,b,t)=>a+(b-a)*t;
   function roFunc(z,H,OD0,OD1,k){ const r0=OD0/2, r1=OD1/2; const t=H>0?z/H:0; if(Math.abs(k)>0){ const mid = lerp(r0,r1,t); const bulge = k*(t*(1-t)); return mid + bulge*(r0||1);} return lerp(r0,r1,t); }
   function riFunc(z,H,ID0,ID1,k){ const r0=ID0/2, r1=ID1/2; const t=H>0?z/H:0; if(Math.abs(k)>0){ const mid=lerp(r0,r1,t); const bulge=k*(t*(1-t)); return mid + bulge*(r0||1);} return lerp(r0,r1,t); }
 
@@ -242,36 +257,35 @@
     }
     for(let j=0;j<nz;j++){
       for(let i=0;i<nr;i++){
-        const n0=j*cols+i, n1=n0+1, n3=(j+1)*cols+i, n2=n3+1; // ccw quad
+        const n0=j*cols+i, n1=n0+1, n3=(j+1)*cols+i, n2=n3+1;
         conn.push([n0,n1,n2,n3]);
       }
     }
     return {nodes,conn,nr,nz,H};
   }
 
-  // ----- Selective reduced integration to avoid volumetric locking -----
+  /* ---------- Assembly (reduced/selective integration) ---------- */
   function assemble(mesh, mat){
     const n=mesh.nodes.length, ndof=2*n; const K=new Float64Array(ndof*ndof);
     const {mu,lambda}=mat;
-
-    function addKeToK(Ke,e){
-      const id=[2*e[0],2*e[0]+1,2*e[1],2*e[1]+1,2*e[2],2*e[2]+1,2*e[3],2*e[3]+1];
+    const addKe=(Ke,e)=>{ const id=[2*e[0],2*e[0]+1,2*e[1],2*e[1]+1,2*e[2],2*e[2]+1,2*e[3],2*e[3]+1];
       for(let a=0;a<8;a++) for(let b=0;b<8;b++) K[id[a]*ndof+id[b]]+=Ke[a*8+b];
-    }
+    };
 
     for(const e of mesh.conn){
       const i0=e[0],i1=e[1],i2=e[2],i3=e[3];
       const r=[mesh.nodes[i0].r, mesh.nodes[i1].r, mesh.nodes[i2].r, mesh.nodes[i3].r];
       const z=[mesh.nodes[i0].z, mesh.nodes[i1].z, mesh.nodes[i2].z, mesh.nodes[i3].z];
 
-      // (1) Deviatoric, 2x2 Gauss, lambda=0
+      // deviatoric (2x2), lambda→0
       const Ke_dev=new Float64Array(64);
       for(const xi of gauss2){
         for(const eta of gauss2){
           const {N,dNdxi,dNdeta}=shapeQ4(xi,eta);
           let Jr=0,Jz=0,Kr=0,Kz=0, rbar=0;
           for(let i=0;i<4;i++){ Jr+=dNdxi[i]*r[i]; Jz+=dNdxi[i]*z[i]; Kr+=dNdeta[i]*r[i]; Kz+=dNdeta[i]*z[i]; rbar+=N[i]*r[i]; }
-          const det=Jr*Kz - Jz*Kr; if(!(det>0)) continue; const inv=1/det;
+          const det=Jr*Kz - Jz*Kr; if(!(det>0)) continue;
+          const inv=1/det;
           const dNdr=new Array(4), dNdz=new Array(4);
           for(let i=0;i<4;i++){ dNdr[i]=(dNdxi[i]*Kz - dNdeta[i]*Jz)*inv; dNdz[i]=(-dNdxi[i]*Kr + dNdeta[i]*Jr)*inv; }
           const ri = Math.max(rbar,1e-8);
@@ -287,45 +301,36 @@
           const Ddev=[[2*mu,0,0,0],[0,2*mu,0,0],[0,0,2*mu,0],[0,0,0,mu]];
           const DB=[new Float64Array(8),new Float64Array(8),new Float64Array(8),new Float64Array(8)];
           for(let i=0;i<4;i++) for(let j=0;j<4;j++){ const Dij=Ddev[i][j]; if(!Dij) continue; for(let k=0;k<8;k++) DB[i][k]+=Dij*B[j][k]; }
-          for(let a=0;a<8;a++) for(let b=0;b<8;b++){
-            let s=0; for(let i=0;i<4;i++) s+=B[i][a]*DB[i][b];
-            Ke_dev[a*8+b]+=s*weight;
-          }
+          for(let a=0;a<8;a++) for(let b=0;b<8;b++){ let s=0; for(let i=0;i<4;i++) s+=B[i][a]*DB[i][b]; Ke_dev[a*8+b]+=s*weight; }
         }
       }
-
-      // (2) Volumetric, 1-point center
+      // volumetric (1x1 center)
       const Ke_vol=new Float64Array(64);
       {
         const xi=0, eta=0; const {N,dNdxi,dNdeta}=shapeQ4(xi,eta);
         let Jr=0,Jz=0,Kr=0,Kz=0, rbar=0;
         for(let i=0;i<4;i++){ Jr+=dNdxi[i]*r[i]; Jz+=dNdxi[i]*z[i]; Kr+=dNdeta[i]*r[i]; Kz+=dNdeta[i]*z[i]; rbar+=N[i]*r[i]; }
         const det=Jr*Kz - Jz*Kr; if(det>0){
-          const inv=1/det; const dNdr=new Array(4), dNdz=new Array(4);
+          const inv=1/det, dNdr=new Array(4), dNdz=new Array(4);
           for(let i=0;i<4;i++){ dNdr[i]=(dNdxi[i]*Kz - dNdeta[i]*Jz)*inv; dNdz[i]=(-dNdxi[i]*Kr + dNdeta[i]*Jr)*inv; }
           const ri=Math.max(rbar,1e-8);
           const V=new Float64Array(8);
-          for(let i=0;i<4;i++){
-            V[2*i]   += dNdr[i] + N[i]/ri; // ε_r + ε_θ
-            V[2*i+1] += dNdz[i];          // ε_z
-          }
-          const weight = det*2*Math.PI*ri;
-          for(let a=0;a<8;a++) for(let b=0;b<8;b++) Ke_vol[a*8+b] += mat.lambda * V[a]*V[b] * weight;
+          for(let i=0;i<4;i++){ V[2*i]+=dNdr[i]+N[i]/ri; V[2*i+1]+=dNdz[i]; }
+          const w=det*2*Math.PI*ri;
+          for(let a=0;a<8;a++) for(let b=0;b<8;b++) Ke_vol[a*8+b]+=mat.lambda*V[a]*V[b]*w;
         }
       }
-
       const Ke=new Float64Array(64); for(let i=0;i<64;i++) Ke[i]=Ke_dev[i]+Ke_vol[i];
-      addKeToK(Ke,e);
+      addKe(Ke,e);
     }
     return K;
   }
 
-  // ---- step shear -> nodal field (2x2 Gauss to nodes by N) ----
+  /* ---------- Shear helpers ---------- */
   function nodalShearFromStep(mesh, u){
     const nN = mesh.nodes.length;
     const shearStep = new Float64Array(nN);
     const wStep = new Float64Array(nN);
-
     for (const e of mesh.conn){
       const r = e.map(i=>mesh.nodes[i].r);
       const z = e.map(i=>mesh.nodes[i].z);
@@ -335,12 +340,9 @@
           let Jr=0,Jz=0,Kr=0,Kz=0;
           for(let i=0;i<4;i++){ Jr+=dNdxi[i]*r[i]; Jz+=dNdxi[i]*z[i]; Kr+=dNdeta[i]*r[i]; Kz+=dNdeta[i]*z[i]; }
           const det=Jr*Kz - Jz*Kr; if(!(det>0)) continue;
-          const inv=1/det;
-          const dNdr=new Array(4), dNdz=new Array(4);
+          const inv=1/det, dNdr=new Array(4), dNdz=new Array(4);
           for(let i=0;i<4;i++){ dNdr[i]=(dNdxi[i]*Kz - dNdeta[i]*Jz)*inv; dNdz[i]=(-dNdxi[i]*Kr + dNdeta[i]*Jr)*inv; }
-          // γ_rz at this GP from this step
           let g=0; for(let a=0;a<4;a++){ const ur=u[2*e[a]], uz=u[2*e[a]+1]; g += dNdz[a]*ur + dNdr[a]*uz; }
-          // spread to nodes by N
           for(let a=0;a<4;a++){ const idx=e[a], w=Math.max(0,N[a]); shearStep[idx]+=g*w; wStep[idx]+=w; }
         }
       }
@@ -349,36 +351,31 @@
     return shearStep;
   }
 
-  // ---------- preview (axes + mesh) ----------
+  /* ---------- Preview + Drawing ---------- */
+  function clamp(v,a,b){ return Math.min(b,Math.max(a,v)); }
+  function colorMapBlueRed(t){ t=clamp(t,0,1); const r=Math.floor(255*t), b=Math.floor(255*(1-t)); return `rgb(${r},0,${b})`; }
+  function updateLegend(){ $('legend').innerHTML=`γ<sub>rz</sub> min=${lastShearMin.toExponential(3)} max=${lastShearMax.toExponential(3)}<br><div style='background:linear-gradient(to right,blue,red);height:10px;margin:4px 0;border-radius:5px'></div>`; }
+
   function drawPreview(){
     const c=must('geom'); const ctx=c.getContext('2d');
     const w=c.clientWidth|0, h=c.clientHeight|0; if(c.width!==w) c.width=w; if(c.height!==h) c.height=h; ctx.clearRect(0,0,w,h);
-    const H=+$('H').value||0.5, OD0=+$('OD0').value||4, OD1=+$('OD1').value||4, ID0=+$('ID0').value||0, ID1=+$('ID1').value||0.5; const type=$('geomType').value; const kout=+$('kout').value||0, kin=+$('kin').value||0;
+    const H=+$('H').value||0.5, OD0=+$('OD0').value||4, OD1=+$('OD1').value||4, ID0=+$('ID0').value||0, ID1=+$('ID1').value||0.5;
+    const type=$('geomType').value; const kout=+$('kout').value||0, kin=+$('kin').value||0;
     const nr=Math.max(2, +$('nr').value|0), nz=Math.max(2, +$('nz').value|0);
     const params={nr,nz,H,OD0,OD1,ID0,ID1,geomType:type,kout,kin,isHollow: $('isHollow').checked};
     const mesh=buildMeshProfiles(params);
     let rmax=-Infinity; for(const n of mesh.nodes){ if(n.r>rmax) rmax=n.r; }
     const pad=16; const sx=(w-2*pad)/Math.max(rmax,1e-9), sz=(h-2*pad)/Math.max(H,1e-9); const s=Math.min(sx,sz);
     ctx.save(); ctx.translate(pad,h-pad); ctx.scale(1,-1);
-    // axes
     ctx.strokeStyle='#999'; ctx.lineWidth=0.8; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(rmax*s,0); ctx.stroke();
     ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(0,H*s); ctx.stroke();
-    // labels upright
     ctx.save(); ctx.scale(1,-1); ctx.fillStyle='#333'; ctx.font='12px Inter,system-ui,sans-serif'; ctx.fillText('r', Math.max(rmax*s-10, 6), -12); ctx.fillText('z', 6, -(H*s-6)); ctx.restore();
-    // mesh
     ctx.strokeStyle='#6875f5'; ctx.lineWidth=0.6; ctx.globalAlpha=0.9;
     for(const e of mesh.conn){ const ids=[e[0],e[1],e[2],e[3],e[0]]; ctx.beginPath(); for(let k=0;k<ids.length;k++){ const i=ids[k]; const n=mesh.nodes[i]; const x=n.r*s, y=n.z*s; if(k===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);} ctx.stroke(); }
-    ctx.globalAlpha=1;
-    ctx.restore();
+    ctx.globalAlpha=1; ctx.restore();
   }
 
-  // ---------- Contours from cumulative nodal shear ----------
-  function clamp(v,a,b){ return Math.min(b,Math.max(a,v)); }
-  function colorMapBlueRed(t){ t=clamp(t,0,1); const r=Math.floor(255*t), b=Math.floor(255*(1-t)); return `rgb(${r},0,${b})`; }
-  function updateLegend(){ $('legend').innerHTML=`γ<sub>rz</sub> min=${lastShearMin.toExponential(3)} max=${lastShearMax.toExponential(3)}<br><div style='background:linear-gradient(to right,blue,red);height:10px;margin:4px 0;border-radius:5px'></div>`; }
-
   function drawShearContoursFromNodal(ctx, mesh, nodal, scale, rmin,zmin,s){
-    // min/max
     let vmin=Infinity,vmax=-Infinity;
     for(let i=0;i<nodal.length;i++){ const v=nodal[i]; if(v<vmin)vmin=v; if(v>vmax)vmax=v; }
     if(!isFinite(vmin)||!isFinite(vmax)||Math.abs(vmax-vmin)<1e-20){ vmin=0; vmax=1e-12; }
@@ -409,7 +406,6 @@
   function drawDeformed(mesh,u,scale){
     const c=must('plot'); const ctx=c.getContext('2d');
     const w=c.clientWidth|0, h=c.clientHeight|0; if(c.width!==w) c.width=w; if(c.height!==h) c.height=h; ctx.clearRect(0,0,w,h);
-    // bounds include original & deformed
     let rmin=Infinity,rmax=-Infinity,zmin=Infinity,zmax=-Infinity;
     for(let i=0;i<mesh.nodes.length;i++){
       const n=mesh.nodes[i];
@@ -419,19 +415,16 @@
     }
     const pad=16; const sx=(w-2*pad)/Math.max(rmax-rmin,1e-9), sz=(h-2*pad)/Math.max(zmax-zmin,1e-9); const s=Math.min(sx,sz);
     ctx.save(); ctx.translate(pad,h-pad); ctx.scale(1,-1);
-    // undeformed
     ctx.strokeStyle='#c9c9c9'; ctx.lineWidth=0.8;
     for(const e of mesh.conn){ const ids=[e[0],e[1],e[2],e[3],e[0]]; ctx.beginPath(); for(let k=0;k<ids.length;k++){ const i=ids[k]; const n=mesh.nodes[i]; const x=(n.r-rmin)*s, y=(n.z-zmin)*s; if(k===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);} ctx.stroke(); }
-    // shear on deformed (cumulative)
     drawShearContoursFromNodal(ctx, mesh, shearCumNodal || new Float64Array(mesh.nodes.length), scale, rmin,zmin,s);
-    // deformed mesh overlay
     ctx.strokeStyle='#111'; ctx.lineWidth=0.8;
     for(const e of mesh.conn){ const ids=[e[0],e[1],e[2],e[3],e[0]]; ctx.beginPath(); for(let k=0;k<ids.length;k++){ const i=ids[k]; const n=mesh.nodes[i]; const x=(n.r+scale*u[2*i]-rmin)*s, y=(n.z+scale*u[2*i+1]-zmin)*s; if(k===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);} ctx.stroke(); }
     ctx.restore();
     updateLegend();
   }
 
-  // ---------- Numeric helpers ----------
+  /* ---------- Solver utilities ---------- */
   function cholSolve(A,b,n){
     for(let i=0;i<n;i++) A[i*n+i]+=1e-12;
     const L=new Float64Array(n*n);
@@ -446,26 +439,17 @@
     return x;
   }
 
-  // ---------- One linear step on current geometry ----------
   function solveOneLinearStep(mesh, mat, dispStep, fixURTopBottom){
     const K = assemble(mesh, mat);
     const ndof = 2*mesh.nodes.length;
 
-    const fixed=[], val=[];
-    const add=(d,v)=>{ const i=fixed.indexOf(d); if(i<0){ fixed.push(d); val.push(v); } };
-
+    const fixed=[], val=[]; const add=(d,v)=>{ const i=fixed.indexOf(d); if(i<0){ fixed.push(d); val.push(v); } };
     const eps=1e-12, Hcur = mesh.H;
     for(let i=0;i<mesh.nodes.length;i++){
       const {r,z}=mesh.nodes[i];
-      if(Math.abs(r) < eps) add(2*i, 0); // axis
-      if(Math.abs(z) < eps){             // bottom
-        if(fixURTopBottom) add(2*i, 0);
-        add(2*i+1, 0);
-      }
-      if(Math.abs(z - Hcur) < eps){      // top
-        if(fixURTopBottom) add(2*i, 0);
-        add(2*i+1, -dispStep);           // INCREMENT only
-      }
+      if(Math.abs(r) < eps) add(2*i, 0);
+      if(Math.abs(z) < eps){ if(fixURTopBottom) add(2*i, 0); add(2*i+1, 0); }
+      if(Math.abs(z - Hcur) < eps){ if(fixURTopBottom) add(2*i, 0); add(2*i+1, -dispStep); }
     }
 
     const isFix=new Uint8Array(ndof); for(const d of fixed) isFix[d]=1;
@@ -473,153 +457,118 @@
     const KU=new Float64Array(nU*nU), rhs=new Float64Array(nU);
     const valOf=d=>{const k=fixed.indexOf(d);return k>=0?val[k]:0;};
 
-    for(let i=0;i<ndof;i++){
-      for(let j=0;j<ndof;j++){
-        const kij=K[i*ndof+j];
-        if(!isFix[i] && !isFix[j]) KU[map[i]*nU+map[j]]+=kij;
-        else if(!isFix[i] && isFix[j]) rhs[map[i]]-=kij*valOf(j);
-      }
+    for(let i=0;i<ndof;i++) for(let j=0;j<ndof;j++){
+      const kij=K[i*ndof+j];
+      if(!isFix[i] && !isFix[j]) KU[map[i]*nU+map[j]]+=kij;
+      else if(!isFix[i] && isFix[j]) rhs[map[i]]-=kij*valOf(j);
     }
 
     const uU = cholSolve(KU, rhs, nU);
     const u  = new Float64Array(ndof);
     for(let i=0;i<ndof;i++) u[i]=isFix[i]?valOf(i):uU[map[i]];
 
-    // Incremental reaction
+    // reactions
     const R=new Float64Array(ndof);
-    for(let i=0;i<ndof;i++){
-      let s=0; const row=i*ndof;
-      for(let j=0;j<ndof;j++) s += K[row+j]*u[j];
-      R[i]=s;
-    }
+    for(let i=0;i<ndof;i++){ let s=0; for(let j=0;j<ndof;j++) s += K[i*ndof+j]*u[j]; R[i]=s; }
     let Finc=0;
-    for(let i=0;i<mesh.nodes.length;i++){
-      if(Math.abs(mesh.nodes[i].z - Hcur) < eps) Finc += -R[2*i+1];
-    }
+    for(let i=0;i<mesh.nodes.length;i++){ if(Math.abs(mesh.nodes[i].z - Hcur) < 1e-12) Finc += -R[2*i+1]; }
     return {u,Finc};
   }
 
   function updateGeometryInPlace(mesh, u){
-    for(let i=0;i<mesh.nodes.length;i++){
-      mesh.nodes[i].r += u[2*i];
-      mesh.nodes[i].z += u[2*i+1];
-    }
-    // re-zero bottom and refresh height
-    let zmin=Infinity, zmax=-Infinity;
-    for(const nd of mesh.nodes){ if(nd.z<zmin) zmin=nd.z; if(nd.z>zmax) zmax=nd.z; }
-    const shift=-zmin;
-    for(const nd of mesh.nodes) nd.z += shift;
+    for(let i=0;i<mesh.nodes.length;i++){ mesh.nodes[i].r += u[2*i]; mesh.nodes[i].z += u[2*i+1]; }
+    let zmin=Infinity, zmax=-Infinity; for(const nd of mesh.nodes){ if(nd.z<zmin) zmin=nd.z; if(nd.z>zmax) zmax=nd.z; }
+    const shift=-zmin; for(const nd of mesh.nodes) nd.z += shift;
     mesh.H = zmax - zmin;
   }
 
-  // ---------- Force–Deflection plotting (nice axes, includes origin) ----------
+  /* ---------- Force–Deflection (pretty axes) ---------- */
   function drawForceDeflectionUL(cv, pts, units){
     const ctx = cv.getContext('2d');
 
-    // size & clear
     const W = cv.width  = cv.clientWidth|0;
     const H = cv.height = cv.clientHeight|0;
     ctx.clearRect(0,0,W,H);
 
-    // data
     const series = [{dx:0, F:0}].concat(pts);
-    const xs = series.map(p=>p.dx);
-    const ys = series.map(p=>p.F);
+    const xs = series.map(p=>p.dx), ys = series.map(p=>p.F);
 
-    // helpers
     function nice(min,max,n){
-      const span=(max-min)||1, raw=span/n;
-      const p10=Math.pow(10, Math.floor(Math.log10(raw)));
+      const span=(max-min)||1, raw=span/n, p10=Math.pow(10,Math.floor(Math.log10(raw)));
       const cand=[1,2,2.5,5,10].map(c=>c*p10);
-      const step=cand.find(c=>raw<=c) || cand[cand.length-1];
-      const lo=Math.floor(min/step)*step, hi=Math.ceil(max/step)*step;
-      const ticks=[]; for(let t=lo; t<=hi+1e-12; t+=step) ticks.push(+t.toFixed(12));
+      const step=cand.find(c=>raw<=c)||cand[cand.length-1];
+      const lo=Math.floor(min/step)*step, hi=Math.ceil(max/step)*step, ticks=[];
+      for(let t=lo;t<=hi+1e-12;t+=step) ticks.push(+t.toFixed(12));
       return {lo,hi,ticks,step};
     }
     function fmt(v){
-      const a = Math.abs(v);
-      if (a === 0) return '0.0';
-      if (a < 1e-3 || a > 1e4) return v.toExponential(2).replace('+','');
-      if (a < 1)   return v.toFixed(4).replace(/\.?0+$/,'');
-      if (a < 10)  return v.toFixed(3).replace(/\.?0+$/,'');
-      if (a < 100) return v.toFixed(2).replace(/\.?0+$/,'');
+      const a=Math.abs(v);
+      if(a===0) return '0.0';
+      if(a<1e-3||a>1e4) return v.toExponential(2).replace('+','');
+      if(a<1)   return v.toFixed(4).replace(/\.?0+$/,'');
+      if(a<10)  return v.toFixed(3).replace(/\.?0+$/,'');
+      if(a<100) return v.toFixed(2).replace(/\.?0+$/,'');
       return v.toFixed(1).replace(/\.?0+$/,'');
     }
 
-    const xR = nice(Math.min(...xs,0), Math.max(...xs,0), 6);
-    const yR = nice(Math.min(...ys,0), Math.max(...ys,0), 8);
+    const xR=nice(Math.min(...xs,0),Math.max(...xs,0),6);
+    const yR=nice(Math.min(...ys,0),Math.max(...ys,0),8);
 
-    // font BEFORE measuring
-    ctx.fillStyle = '#374151';
-    ctx.font = '12px Inter,system-ui,sans-serif';
+    ctx.fillStyle='#374151';
+    ctx.font='12px Inter,system-ui,sans-serif';
 
-    // dynamic left padding + gutter
-    const yTickStrings = yR.ticks.map(fmt);
-    let widest = 0;
-    for (const s of yTickStrings) widest = Math.max(widest, ctx.measureText(s).width);
+    const widest=Math.max(...yR.ticks.map(t=>ctx.measureText(fmt(t)).width));
+    const gutterL=28;
+    const pad={ l:Math.max(72,Math.ceil(14+widest)), r:36, t:28, b:56 };
 
-    const gutterL = 28;
-    const pad = { l: Math.max(72, Math.ceil(14 + widest)), r: 36, t: 28, b: 56 };
-
-    const gx = pad.l + gutterL;
-    const w  = Math.max(1, W - gx - pad.r);
-    const h  = Math.max(1, H - pad.t - pad.b);
-    const X = x => gx + w*((x - xR.lo)/Math.max(1e-30,(xR.hi-xR.lo)));
-    const Y = y => pad.t + h*(1 - (y - yR.lo)/Math.max(1e-30,(yR.hi-yR.lo)));
+    const gx=pad.l+gutterL, w=Math.max(1,W-gx-pad.r), h=Math.max(1,H-pad.t-pad.b);
+    const X=x=>gx+w*((x-xR.lo)/Math.max(1e-30,(xR.hi-xR.lo)));
+    const Y=y=>pad.t+h*(1-(y-yR.lo)/Math.max(1e-30,(yR.hi-yR.lo)));
 
     // grid
-    ctx.strokeStyle='#e5e7eb'; ctx.lineWidth=1;
-    ctx.beginPath();
-    for(const xt of xR.ticks){ ctx.moveTo(X(xt), pad.t); ctx.lineTo(X(xt), pad.t+h); }
-    for(const yt of yR.ticks){ ctx.moveTo(gx, Y(yt)); ctx.lineTo(gx+w, Y(yt)); }
+    ctx.strokeStyle='#e5e7eb'; ctx.lineWidth=1; ctx.beginPath();
+    for(const xt of xR.ticks){ ctx.moveTo(X(xt),pad.t); ctx.lineTo(X(xt),pad.t+h); }
+    for(const yt of yR.ticks){ ctx.moveTo(gx,Y(yt)); ctx.lineTo(gx+w,Y(yt)); }
     ctx.stroke();
 
     // axes
-    ctx.strokeStyle='#9ca3af'; ctx.lineWidth=1.2;
-    ctx.beginPath();
-    ctx.moveTo(gx, pad.t);   ctx.lineTo(gx, pad.t+h);
-    ctx.moveTo(gx, pad.t+h); ctx.lineTo(gx+w, pad.t+h);
+    ctx.strokeStyle='#9ca3af'; ctx.lineWidth=1.2; ctx.beginPath();
+    ctx.moveTo(gx,pad.t); ctx.lineTo(gx,pad.t+h);
+    ctx.moveTo(gx,pad.t+h); ctx.lineTo(gx+w,pad.t+h);
     ctx.stroke();
 
-    // tick labels
+    // ticks
     ctx.textAlign='center'; ctx.textBaseline='top';
-    for(const xt of xR.ticks) ctx.fillText(fmt(xt), X(xt), pad.t+h+6);
-    ctx.textAlign='right'; ctx.textBaseline='middle';
-    for(const yt of yR.ticks) ctx.fillText(fmt(yt), pad.l-6, Y(yt));
+    for(const xt of xR.ticks) ctx.fillText(fmt(xt),X(xt),pad.t+h+6);
+    ctx.textAlign='right';  ctx.textBaseline='middle';
+    for(const yt of yR.ticks) ctx.fillText(fmt(yt),pad.l-6,Y(yt));
 
-    // axis titles
+    // titles
     ctx.fillStyle='#111827';
     ctx.textAlign='center'; ctx.textBaseline='top';
-    ctx.fillText(`Deflection ${units.dx}`, gx + w/2, H - 20);
-    ctx.save(); ctx.translate(pad.l - 36, pad.t + h/2); ctx.rotate(-Math.PI/2);
+    ctx.fillText(`Deflection ${units.dx}`, gx+w/2, H-20);
+    ctx.save(); ctx.translate(pad.l-36, pad.t+h/2); ctx.rotate(-Math.PI/2);
     ctx.fillText(`Force ${units.F}`, 0, 0);
     ctx.restore();
 
     // series
-    ctx.strokeStyle='#2563eb'; ctx.lineWidth=2;
-    ctx.beginPath();
-    ctx.moveTo(X(series[0].dx), Y(series[0].F));
-    for(let i=1;i<series.length;i++) ctx.lineTo(X(series[i].dx), Y(series[i].F));
+    ctx.strokeStyle='#2563eb'; ctx.lineWidth=2; ctx.beginPath();
+    ctx.moveTo(X(series[0].dx),Y(series[0].F));
+    for(let i=1;i<series.length;i++) ctx.lineTo(X(series[i].dx),Y(series[i].F));
     ctx.stroke();
 
     // points
     ctx.fillStyle='#ef4444';
-    for(const p of series){ ctx.beginPath(); ctx.arc(X(p.dx), Y(p.F), 3, 0, 2*Math.PI); ctx.fill(); }
+    for(const p of series){ ctx.beginPath(); ctx.arc(X(p.dx),Y(p.F),3,0,2*Math.PI); ctx.fill(); }
   }
 
-  // ---------- Solve wrappers ----------
+  /* ---------- Solvers ---------- */
   function solveSingleLinear(){
     const G=+$('G').value||120, Kbulk=+$('K').value||180000;
     const H=+$('H').value||0.5, disp=+$('disp').value||0.01;
     const nr=Math.max(2, +$('nr').value|0), nz=Math.max(2, +$('nz').value|0);
 
-    const params={
-      nr,nz,H,
-      OD0:+$('OD0').value||4, OD1:+$('OD1').value||4,
-      ID0:+$('ID0').value||0, ID1:+$('ID1').value||0.5,
-      geomType:$('geomType').value, kout:+$('kout').value||0, kin:+$('kin').value||0,
-      isHollow:$('isHollow').checked
-    };
+    const params={nr,nz,H,OD0:+$('OD0').value||4, OD1:+$('OD1').value||4, ID0:+$('ID0').value||0, ID1:+$('ID1').value||0.5, geomType:$('geomType').value, kout:+$('kout').value||0, kin:+$('kin').value||0, isHollow:$('isHollow').checked};
     const mesh=buildMeshProfiles(params);
     const mat=matFromGK(G,Kbulk); $('nuBox').value=nuFromGK(G,Kbulk).toFixed(6);
 
@@ -650,16 +599,22 @@
     let F=0; for(let i=0;i<mesh.nodes.length;i++){ if(Math.abs(mesh.nodes[i].z-H)<1e-12) F += -R[2*i+1]; }
     const k=F/disp; $('kpi').textContent=`k = ${k.toExponential(4)} (force/disp)`; $('solveBadge').textContent='Solved.';
 
-    // store for drawing
     lastMesh=mesh; lastU=u;
-    // cumulative shear = this step's shear
+    // per-frame linear interpolation for animation
     shearCumNodal = nodalShearFromStep(mesh, u);
 
-    const sc= +$('scale').value || +$('scaleSlider').value || 10; $('scaleSlider').value=sc; $('scale').value=sc;
-    drawDeformed(mesh,u,sc);
+    // Build animation frames: 30 linear frames on original mesh
+    animFrames=[]; animPts=[];
+    const nFrames=30;
+    for(let f=1; f<=nFrames; f++){
+      const t=f/nFrames;
+      const uF=new Float64Array(u.length); for(let i=0;i<u.length;i++) uF[i]=u[i]*t;
+      animFrames.push({mesh: cloneMesh(mesh), u: uF, shearCum: nodalShearFromStep(mesh, uF), F: F*t, dx: disp*t});
+      animPts.push({dx:disp*t, F:F*t});
+    }
 
-    // FD plot: one point plus origin
     const units = ($('units').value==='si') ? {F:'N', dx:'mm', k:'N/mm'} : {F:'lbf', dx:'in', k:'lbf/in'};
+    drawDeformed(mesh,u,+$('scale').value||10);
     drawForceDeflectionUL($('cvFD'), [{dx:disp, F:F}], units);
   }
 
@@ -667,63 +622,87 @@
     const G= +$('G').value || 120;
     const K= +$('K').value || 180000;
     const H0= +$('H').value || 0.5;
-    const dTot = +$('disp').value || 0; // signed
+    const dTot = +$('disp').value || 0;
     let nSteps = Math.max(1, (+$('ulSteps').value|0) || 5);
     const fixURTopBottom = ($('urMode').value === 'fix');
 
-    // modest per-step strain guard (~2%)
     const maxStepStrain = 0.02;
     nSteps = Math.max(nSteps, Math.ceil(Math.abs(dTot)/Math.max(1e-12, maxStepStrain*H0)));
 
     const mat = matFromGK(G, K);
-    const params={
-      nr:Math.max(2, +$('nr').value|0),
-      nz:Math.max(2, +$('nz').value|0),
-      H:H0,
-      OD0:+$('OD0').value||4, OD1:+$('OD1').value||4,
-      ID0:+$('ID0').value||0, ID1:+$('ID1').value||0.5,
-      geomType:$('geomType').value,
-      kout:+$('kout').value||0, kin:+$('kin').value||0,
-      isHollow:$('isHollow').checked
-    };
-    let mesh = buildMeshProfiles(params);
-    mesh.H = H0;
+    const params={nr:Math.max(2, +$('nr').value|0), nz:Math.max(2, +$('nz').value|0), H:H0, OD0:+$('OD0').value||4, OD1:+$('OD1').value||4, ID0:+$('ID0').value||0, ID1:+$('ID1').value||0.5, geomType:$('geomType').value, kout:+$('kout').value||0, kin:+$('kin').value||0, isHollow:$('isHollow').checked};
+    let mesh = buildMeshProfiles(params); mesh.H = H0;
 
     const dStep = dTot / nSteps;
     let Ftot = 0, xtot = 0;
-    const pts = [];
+    const units = ($('units').value==='si') ? {F:'N', dx:'mm', k:'N/mm'} : {F:'lbf', dx:'in', k:'lbf/in'};
 
-    // init cumulative shear
     shearCumNodal = new Float64Array(mesh.nodes.length);
+    animFrames=[]; animPts=[];
 
     for(let s=0; s<nSteps; s++){
       const {u, Finc} = solveOneLinearStep(mesh, mat, dStep, fixURTopBottom);
-
-      // accumulate shear from this step BEFORE geometry update
       const shearStep = nodalShearFromStep(mesh, u);
       for(let i=0;i<shearCumNodal.length;i++) shearCumNodal[i] += shearStep[i];
 
-      Ftot += Finc;
-      xtot += dStep;
-      pts.push({dx: xtot, F: Ftot});
+      Ftot += Finc; xtot += dStep;
 
-      updateGeometryInPlace(mesh, u); // prepare for next step
-      lastMesh = mesh; lastU = u;      // keep last for viewing
+      // snapshot BEFORE geometry update for end-of-step
+      animFrames.push({mesh: cloneMesh(mesh), u: u.slice(), shearCum: shearCumNodal.slice(), F: Ftot, dx: xtot});
+      animPts.push({dx: xtot, F: Ftot});
+
+      updateGeometryInPlace(mesh, u);
+      lastMesh = mesh; lastU = u;
     }
 
     $('solveBadge').textContent='Solved.';
     const sc= +$('scale').value || +$('scaleSlider').value || 10; $('scaleSlider').value=sc; $('scale').value=sc;
     drawDeformed(lastMesh,lastU,sc);
+    drawForceDeflectionUL($('cvFD'), animPts, units);
 
-    const units = ($('units').value==='si') ? {F:'N', dx:'mm', k:'N/mm'} : {F:'lbf', dx:'in', k:'lbf/in'};
-    drawForceDeflectionUL($('cvFD'), pts, units);
-
-    // effective tangent stiffness at the end (approx)
     const kEff = (Math.abs(dTot)>1e-30) ? (Ftot/dTot) : 0;
     $('kpi').textContent = `UL: k ≈ ${kEff.toExponential(4)} (force/disp), steps=${nSteps}`;
   }
 
-  // ---------- UI wiring ----------
+  /* ---------- Animation controls ---------- */
+  function cloneMesh(mesh){
+    return { H: mesh.H, nr: mesh.nr, nz: mesh.nz,
+      nodes: mesh.nodes.map(n=>({r:n.r, z:n.z})),
+      conn: mesh.conn.map(e=>e.slice()) };
+  }
+
+  function playAnimation(){
+    if(!animFrames.length){ $('animBadge').textContent='No frames. Solve first.'; return; }
+    stopAnimation(true);
+    animPlaying=true; animIdx=0; animDir=1; $('animBadge').textContent='Playing…';
+
+    const units = ($('units').value==='si') ? {F:'N', dx:'mm'} : {F:'lbf', dx:'in'};
+    const fps = 30, dt = 1000/fps;
+
+    animTimer = setInterval(()=>{
+      // draw current frame
+      const f = animFrames[Math.min(Math.max(animIdx,0), animFrames.length-1)];
+      lastMesh = f.mesh; lastU = f.u; shearCumNodal = f.shearCum;
+      drawDeformed(f.mesh, f.u, +$('scale').value || 10);
+
+      // FD up to this index (clamped)
+      const showTo = Math.min(Math.max(animIdx,0), animPts.length-1);
+      drawForceDeflectionUL($('cvFD'), animPts.slice(0, showTo+1), units);
+
+      // advance with ping-pong reflection
+      animIdx += animDir;
+      if (animIdx >= animFrames.length) { animIdx = animFrames.length - 2; animDir = -1; }
+      else if (animIdx < 0)            { animIdx = 1;                  animDir = 1;  }
+    }, dt);
+  }
+
+  function stopAnimation(quiet=false){
+    if(animTimer) clearInterval(animTimer);
+    animTimer=null; animPlaying=false;
+    $('animBadge').textContent = quiet ? 'Ready.' : 'Stopped.';
+  }
+
+  /* ---------- UI wiring ---------- */
   function syncPair(slider, box){
     const s=$(slider), b=$(box); if(!s||!b) return;
     const apply=()=>{ b.value=s.value; if(lastMesh&&lastU) drawDeformed(lastMesh,lastU,+s.value||0); };
@@ -747,15 +726,20 @@
 
   $('solveBtn').addEventListener('click', ()=>{
     try{
+      stopAnimation(true);
       $('solveBadge').textContent='Solving…';
       $('nuBox').value = nuFromGK(+$('G').value||120, +$('K').value||180000).toFixed(6);
       if($('solveMode').value==='ul') solveIncrementalUL();
       else solveSingleLinear();
+      $('animBadge').textContent='Ready.';
     }catch(err){
       console.error(err);
       $('solveBadge').textContent='Error';
     }
   });
+
+  $('animBtn').addEventListener('click', playAnimation);
+  $('animStopBtn').addEventListener('click', ()=>stopAnimation(false));
 
   ;['geomType','OD0','OD1','ID0','ID1','H','nr','nz','isHollow','kout','kin']
     .forEach(id=> $(id).addEventListener('input', ()=>{ toggleKControls(); toggleGeomLocks(); drawPreview(); }));
